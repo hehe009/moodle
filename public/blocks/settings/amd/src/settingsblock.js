@@ -28,7 +28,17 @@ export const init = (instanceId, siteAdminNodeId) => {
     const blockNode = document.querySelector(`[data-instance-id="${instanceId}"]`);
 
     if (siteAdminNodeId) {
-        const siteAdminLink = adminTree.treeRoot.get(0).querySelector(`#${siteAdminNodeId} a`);
+        const rootNode = adminTree.treeRoot?.get(0);
+
+        // If the settings block exists but has no tree, do nothing.
+        if (!rootNode) {
+            return;
+        }
+
+        const siteAdminLink = rootNode.querySelector(`#${siteAdminNodeId} a`);
+        if (!siteAdminLink) {
+            return;
+        }
         const newContainer = document.createElement('span');
         newContainer.setAttribute('tabindex', '0');
         siteAdminLink.childNodes.forEach(node => newContainer.appendChild(node));
