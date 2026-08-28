@@ -2494,6 +2494,7 @@ function mod_quiz_output_fragment_add_random_question_form($args) {
     $slotid = clean_param($args['slotid'] ?? 0, PARAM_INT);
     if (empty($slotid)) {
         $params = $args;
+        $categorycmid = clean_param($args['bankcmid'], PARAM_INT);
     } else {
         $contextid = \core\context\module::instance(clean_param($args['quizcmid'], PARAM_INT))->id;
         // Load the stored filters for the current slot.
@@ -2508,6 +2509,11 @@ function mod_quiz_output_fragment_add_random_question_form($args) {
             $filterconditions,
         );
         $params = \core_question\local\bank\filter_condition_manager::filter_invalid_values($filterconditions);
+
+        // Resolve the category picker's context from the slot's OWN,
+        // authoritative category context.
+        $categorycontext = \core\context::instance_by_id($setreference->questionscontextid);
+        $categorycmid = $categorycontext->instanceid;
     }
 
     if (!empty($args['savedfiltercondition'])) {
@@ -2517,7 +2523,7 @@ function mod_quiz_output_fragment_add_random_question_form($args) {
 
     $extraparams = [];
     $extraparams['quizcmid'] = clean_param($args['quizcmid'], PARAM_INT);
-    $extraparams['cmid'] = clean_param($args['bankcmid'], PARAM_INT);
+    $extraparams['cmid'] = $categorycmid;
 
     // Build required parameters.
     [$contexts, $thispageurl, $cm, $pagevars, $extraparams] =
