@@ -41,6 +41,69 @@ require_once($CFG->dirroot . '/mod/quiz/tests/quiz_question_helper_test_trait.ph
 final class lib_test extends \advanced_testcase {
     use \quiz_question_helper_test_trait;
 
+    /**
+     * Test for random question 'Configure question' dialog category display
+     *
+     * @covers ::mod_quiz_output_fragment_add_random_question_form
+     */
+    public function test_add_random_question_form_resolves_category_context_for_existing_slot(): void {
+        global $DB;
+
+        $this->resetAfterTest();
+        $this->setAdminUser();
+
+        $course = $this->getDataGenerator()->create_course();
+
+        // The quiz whose own cmid will be passed as the (deliberately wrong) 'bankcmid'.
+        $quiz = $this->getDataGenerator()->create_module('quiz', ['course' => $course->id]);
+        $quizcm = get_coursemodule_from_instance('quiz', $quiz->id);
+
+        // A SEPARATE module hosting a category that does not belong to
+        // the quiz's own private bank - this reproduces the bug.
+        $qbank = $this->getDataGenerator()->create_module('qbank', ['course' => $course->id]);
+        $qbankcontext = \core\context\module::instance($qbank->cmid);
+
+        $questiongenerator = $this->getDataGenerator()->get_plugin_generator('core_question');
+        $category = $questiongenerator->create_question_category(['contextid' => $qbankcontext->id]);
+        $questiongenerator->create_question('truefalse', null, ['category' => $category->id]);
+
+        $this->add_random_questions($quiz->id, 1, $category->id, 1);
+
+        $slots = $DB->get_records('quiz_slots', ['quizid' => $quiz->id], 'slot DESC', '*', 0, 1);
+        $slot = reset($slots);
+        $this->assertNotFalse($slot, 'The random question slot was not created as expected.');
+
+        $setreference = $DB->get_record('question_set_references', [
+            'component' => 'mod_quiz',
+            'questionarea' => 'slot',
+            'itemid' => $slot->id,
+        ]);
+        $this->assertNotFalse($setreference, 'The question_set_references row was not created as expected.');
+        $filtercondition = json_decode($setreference->filtercondition, true);
+        $filtercondition['cat'] = "{$category->id},{$qbankcontext->id}";
+        $setreference->filtercondition = json_encode($filtercondition);
+        $DB->update_record('question_set_references', $setreference);
+
+        $args = [
+            'quizcmid' => $quizcm->id,
+            // Deliberately the WRONG module - the quiz's own cmid, not the qbank's - matching
+            // what the page-wide default actually is in practice, unless the user has manually
+            // switched banks for this specific interaction.
+            'bankcmid' => $quizcm->id,
+            'slotid' => $slot->id,
+            'returnurl' => '/mod/quiz/edit.php',
+        ];
+
+        $html = mod_quiz_output_fragment_add_random_question_form($args);
+
+        $this->assertStringContainsString(
+            'value="' . $category->id . '"',
+            $html,
+            "Expected the slot's own category ({$category->name}) to appear as an option in the " .
+            'category picker at all.'
+        );
+    }
+
     public function test_quiz_has_grades(): void {
         $quiz = new \stdClass();
         $quiz->grade = '100.0000';
