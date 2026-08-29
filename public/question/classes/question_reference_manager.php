@@ -171,4 +171,80 @@ class question_reference_manager {
         $sets->close();
         return $updates;
     }
+
+    /**
+     * Ensure consistency of filter 'cat' parameter and questionscontextid against the CURRENT,
+     * authoritative contextid of the question category each set reference actually points at.
+     *
+     * @param string $select Optional SQL WHERE clause (without the "WHERE" keyword) to restrict
+     *     which question_set_references rows are checked, for example to scope this to a single
+     *     component/questionarea or a specific set of usingcontextid values. Empty string (the
+     *     default) checks every row in the table.
+     * @param array $params Query parameters for placeholders used in $select.
+     * @return int The number of records that were updated.
+     */
+    public static function fix_stale_category_context(string $select = '', array $params = []): int {
+        global $DB;
+        $updates = 0;
+        $sets = $DB->get_recordset_select('question_set_references', $select, $params);
+        foreach ($sets as $set) {
+            if (self::fix_stale_category_context_for_reference($set)) {
+                $updates++;
+            }
+        }
+        $sets->close();
+        return $updates;
+    }
+
+    /**
+     * Correct a single question_set_references row's questionscontextid and embedded
+     * filtercondition['cat'] value, if they disagree with the current, authoritative contextid
+     * of the question category the reference's filter condition actually points at.
+     *
+     * @param \stdClass $set A record from the question_set_references table.
+     * @return bool True if the record was stale and has been corrected, false if it was already
+     *     consistent (or could not be checked, for example because its filter condition could not
+     *     be parsed, or the category it refers to no longer exists).
+     */
+    protected static function fix_stale_category_context_for_reference(\stdClass $set): bool {
+        global $DB;
+
+        $filtercondition = json_decode($set->filtercondition, true);
+        if (!is_array($filtercondition)) {
+            return false;
+        }
+        if (!array_key_exists('filter', $filtercondition)) {
+            $filtercondition = self::convert_legacy_set_reference_filter_condition($filtercondition);
+        }
+
+        $catid = $filtercondition['filter']['category']['values'][0] ?? null;
+        if ($catid === null) {
+            return false;
+        }
+
+        $catidwasplaceholder = ((int) $catid === 0);
+        if ($catidwasplaceholder) {
+            if (empty($set->usingcontextid)) {
+                return false;
+            }
+            $catid = question_get_top_category($set->usingcontextid, true)->id;
+        }
+
+        $category = $DB->get_record('question_categories', ['id' => $catid]);
+        if (!$category) {
+            return false;
+        }
+
+        $authoritativecontextid = (int) $category->contextid;
+        if (!$catidwasplaceholder && (int) $set->questionscontextid === $authoritativecontextid) {
+            return false;
+        }
+
+        $filtercondition['filter']['category']['values'][0] = $catid;
+        $filtercondition['cat'] = "{$catid},{$authoritativecontextid}";
+        $set->questionscontextid = $authoritativecontextid;
+        $set->filtercondition = json_encode($filtercondition);
+        $DB->update_record('question_set_references', $set);
+        return true;
+    }
 }
