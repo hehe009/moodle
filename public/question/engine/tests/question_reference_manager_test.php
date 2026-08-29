@@ -198,4 +198,206 @@ final class question_reference_manager_test extends advanced_testcase {
             $filtercondition['cat'],
         );
     }
+
+    /**
+     * A set reference whose questionscontextid and embedded filtercondition['cat'] already agree
+     * with each other, but are both stale relative to question_categories.contextid, should still
+     * be corrected by fix_stale_category_context() - this is the case
+     * fix_set_references_category_context() (MDL-86691) cannot detect, because it only compares
+     * a set reference's questionscontextid against its own filtercondition['cat'], not against
+     * the category's actual current contextid.
+     * @covers ::fix_stale_category_context
+     */
+    public function test_fix_stale_category_context(): void {
+        global $DB;
+        $this->resetAfterTest();
+
+        $questiongenerator = $this->getDataGenerator()->get_plugin_generator('core_question');
+        $correctcategory = $questiongenerator->create_question_category();
+        $movedcategory = $questiongenerator->create_question_category();
+
+        // A reference that is already correct: questionscontextid matches the category's
+        // current contextid, and so does the embedded filtercondition['cat'].
+        $correctreference = (object) [
+            'usingcontextid' => 1,
+            'component' => 'mod_quiz',
+            'questionarea' => 'slot',
+            'itemid' => 1,
+            'questionscontextid' => $correctcategory->contextid,
+            'filtercondition' => json_encode([
+                'filter' => [
+                    'category' => [
+                        'name' => 'category',
+                        'jointype' => 1,
+                        'values' => [$correctcategory->id],
+                        'filteroptions' => ['includesubcategories' => 0],
+                    ],
+                ],
+                'cat' => "{$correctcategory->id},{$correctcategory->contextid}",
+            ]),
+        ];
+        $correctreference->id = $DB->insert_record('question_set_references', $correctreference);
+
+        // A reference that is internally self-consistent (questionscontextid agrees with its own
+        // filtercondition['cat']) but both are stale: the category has since moved to a different
+        // contextid than either of them records. fix_set_references_category_context() would not
+        // detect this, since it only compares the two stored values against each other.
+        $stalecontextid = $movedcategory->contextid + 1000; // Guaranteed to differ from the real one.
+        $stalereference = (object) [
+            'usingcontextid' => 1,
+            'component' => 'mod_quiz',
+            'questionarea' => 'slot',
+            'itemid' => 2,
+            'questionscontextid' => $stalecontextid,
+            'filtercondition' => json_encode([
+                'filter' => [
+                    'category' => [
+                        'name' => 'category',
+                        'jointype' => 1,
+                        'values' => [$movedcategory->id],
+                        'filteroptions' => ['includesubcategories' => 0],
+                    ],
+                ],
+                'cat' => "{$movedcategory->id},{$stalecontextid}",
+            ]),
+        ];
+        $stalereference->id = $DB->insert_record('question_set_references', $stalereference);
+
+        // A legacy-format reference (pre-4.3 style, no 'filter' key) pointing at the same moved
+        // category, to confirm the legacy conversion path is also corrected.
+        $legacyreference = (object) [
+            'usingcontextid' => 1,
+            'component' => 'mod_quiz',
+            'questionarea' => 'slot',
+            'itemid' => 3,
+            'questionscontextid' => $stalecontextid,
+            'filtercondition' => json_encode([
+                'questioncategoryid' => $movedcategory->id,
+                'includingsubcategories' => false,
+            ]),
+        ];
+        $legacyreference->id = $DB->insert_record('question_set_references', $legacyreference);
+
+        $fixedcount = question_reference_manager::fix_stale_category_context();
+        $this->assertEquals(2, $fixedcount);
+
+        // The already-correct reference must be left untouched.
+        $updatedcorrect = $DB->get_record('question_set_references', ['id' => $correctreference->id]);
+        $this->assertEquals($correctreference, $updatedcorrect);
+
+        // The stale (but self-consistent) reference must now point at the category's real context.
+        $updatedstale = $DB->get_record('question_set_references', ['id' => $stalereference->id]);
+        $this->assertEquals($movedcategory->contextid, $updatedstale->questionscontextid);
+        $stalefilter = json_decode($updatedstale->filtercondition, true);
+        $this->assertEquals("{$movedcategory->id},{$movedcategory->contextid}", $stalefilter['cat']);
+
+        // The legacy-format reference must also be corrected and converted.
+        $updatedlegacy = $DB->get_record('question_set_references', ['id' => $legacyreference->id]);
+        $this->assertEquals($movedcategory->contextid, $updatedlegacy->questionscontextid);
+        $legacyfilter = json_decode($updatedlegacy->filtercondition, true);
+        $this->assertEquals($movedcategory->id, $legacyfilter['filter']['category']['values'][0]);
+        $this->assertEquals("{$movedcategory->id},{$movedcategory->contextid}", $legacyfilter['cat']);
+    }
+
+    /**
+     * A set reference whose stored category id is the literal placeholder 0 - which can happen
+     * when a category mapping (particularly a context's "top" category) has not been resolved
+     * yet at the point the filter condition was written during a restore - must be recovered via
+     * the reference's own usingcontextid, resolving to that context's top category, rather than
+     * being treated as "no category present" and skipped.
+     * @covers ::fix_stale_category_context
+     */
+    public function test_fix_stale_category_context_placeholder_zero(): void {
+        global $DB;
+        $this->resetAfterTest();
+
+        $questiongenerator = $this->getDataGenerator()->get_plugin_generator('core_question');
+        $category = $questiongenerator->create_question_category();
+        $topcategory = question_get_top_category($category->contextid, true);
+
+        $reference = (object) [
+            'usingcontextid' => $category->contextid,
+            'component' => 'mod_quiz',
+            'questionarea' => 'slot',
+            'itemid' => 1,
+            'questionscontextid' => $category->contextid + 1000, // Deliberately wrong too.
+            'filtercondition' => json_encode([
+                'filter' => [
+                    'category' => [
+                        'name' => 'category',
+                        'jointype' => 1,
+                        'values' => [0],
+                        'filteroptions' => ['includesubcategories' => true],
+                    ],
+                ],
+                'cat' => "0,{$category->contextid}",
+            ]),
+        ];
+        $reference->id = $DB->insert_record('question_set_references', $reference);
+
+        $fixedcount = question_reference_manager::fix_stale_category_context();
+        $this->assertEquals(1, $fixedcount);
+
+        $updated = $DB->get_record('question_set_references', ['id' => $reference->id]);
+        $this->assertEquals($topcategory->contextid, $updated->questionscontextid);
+        $filter = json_decode($updated->filtercondition, true);
+        $this->assertEquals($topcategory->id, $filter['filter']['category']['values'][0]);
+        $this->assertEquals("{$topcategory->id},{$topcategory->contextid}", $filter['cat']);
+    }
+
+    /**
+     * The $select/$params arguments to fix_stale_category_context() should scope which records
+     * are checked, so callers (such as the restore step this was written for) can limit the
+     * check to just the records relevant to them rather than scanning the whole table.
+     * @covers ::fix_stale_category_context
+     */
+    public function test_fix_stale_category_context_scoped(): void {
+        global $DB;
+        $this->resetAfterTest();
+
+        $questiongenerator = $this->getDataGenerator()->get_plugin_generator('core_question');
+        $category = $questiongenerator->create_question_category();
+        $stalecontextid = $category->contextid + 1000;
+
+        $inscopereference = (object) [
+            'usingcontextid' => 1,
+            'component' => 'mod_quiz',
+            'questionarea' => 'slot',
+            'itemid' => 1,
+            'questionscontextid' => $stalecontextid,
+            'filtercondition' => json_encode([
+                'filter' => ['category' => ['name' => 'category', 'jointype' => 1,
+                    'values' => [$category->id], 'filteroptions' => ['includesubcategories' => 0]]],
+                'cat' => "{$category->id},{$stalecontextid}",
+            ]),
+        ];
+        $inscopereference->id = $DB->insert_record('question_set_references', $inscopereference);
+
+        $outofscopereference = (object) [
+            'usingcontextid' => 1,
+            'component' => 'mod_someotherplugin',
+            'questionarea' => 'slot',
+            'itemid' => 1,
+            'questionscontextid' => $stalecontextid,
+            'filtercondition' => json_encode([
+                'filter' => ['category' => ['name' => 'category', 'jointype' => 1,
+                    'values' => [$category->id], 'filteroptions' => ['includesubcategories' => 0]]],
+                'cat' => "{$category->id},{$stalecontextid}",
+            ]),
+        ];
+        $outofscopereference->id = $DB->insert_record('question_set_references', $outofscopereference);
+
+        $fixedcount = question_reference_manager::fix_stale_category_context(
+            'component = :component',
+            ['component' => 'mod_quiz']
+        );
+        $this->assertEquals(1, $fixedcount);
+
+        $updatedinscope = $DB->get_record('question_set_references', ['id' => $inscopereference->id]);
+        $this->assertEquals($category->contextid, $updatedinscope->questionscontextid);
+
+        // The out-of-scope record must be left untouched, even though it also needed fixing.
+        $updatedoutofscope = $DB->get_record('question_set_references', ['id' => $outofscopereference->id]);
+        $this->assertEquals($stalecontextid, $updatedoutofscope->questionscontextid);
+    }
 }

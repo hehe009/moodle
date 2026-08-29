@@ -214,6 +214,7 @@ $string['importwrongfiletype'] = 'The type of the file you selected ({$a->actual
 $string['invalidarg'] = 'No valid arguments supplied or incorrect server configuration';
 $string['invalidcategory'] = 'Invalid category provided for this question bank view.';
 $string['invalidcategoryeditq'] = 'Invalid category provided for this question bank view. Ask your administrator to try running the question/cli/fix_set_references_category_context.php script.';
+$string['invalidcategoryeditqstalecontext'] = 'Invalid category provided for this question bank view. This can happen when a question category has been relocated to a different context (for example during a course restore) without every reference to it being updated to match. Ask your administrator to try running the question/cli/fix_stale_set_reference_category_context.php script.';
 $string['invalidcategoryidforparent'] = 'Invalid category id for parent!';
 $string['invalidcategoryidtomove'] = 'Invalid category id to move!';
 $string['invalidconfirm'] = 'Confirmation string was incorrect';
