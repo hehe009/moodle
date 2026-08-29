@@ -5764,14 +5764,25 @@ class restore_move_module_questions_categories extends restore_execution_step {
                 ];
                 $params += $categoryidparams;
                 $DB->execute($sqlupdate, $params);
+            }
 
-                // As explained in {@see restore_quiz_activity_structure_step::process_quiz_question_legacy_instance()}
-                // question_set_references relating to random questions restored from old backups,
-                // which pick from context_module question_categores, will have been restored with the wrong questioncontextid.
-                // So, now, we need to find those, and updated the questioncontextid.
-                // We can only find them by picking apart the filter conditions, and seeign which categories they refer to.
-
-                // We need to check all the question_set_references belonging to this context_module.
+             // As explained in {@see restore_quiz_activity_structure_step::process_quiz_question_legacy_instance()}
+            // question_set_references relating to random questions restored from old backups,
+            // which pick from context_module question_categories, will have been restored with the wrong questionscontextid.
+            // So, now, we need to find those, and update the questionscontextid.
+            // We can only find them by picking apart the filter conditions, and seeing which categories they refer to.
+            //
+            // Note: if this module's original backup had an old-style, parentless "top level" category
+            // (pre-3.5 backups), it was merged into $top above and is NOT present in $categoryids - its
+            // original id only lives in $oldtopid. But process_quiz_question_legacy_instance() ran BEFORE
+            // this merge happened, using the category's original (pre-merge) id via a direct DB join rather
+            // than the backup id mapping table, so any set_reference for a random question that was pointing
+            // at that old top-level category will still have that original id in its filter condition, and
+            // must be matched separately against $oldtopid and redirected to $top instead.
+            //
+            // This must run even when $categoryids is empty (e.g. a bank that contained only the old
+            // top-level category and no other categories), so it is NOT gated on $categoryids.
+            if ($categoryids || $oldtopid) {
                 $references = $DB->get_records('question_set_references', ['usingcontextid' => $newcontext->newitemid]);
                 foreach ($references as $reference) {
                     $filtercondition = json_decode($reference->filtercondition, true);
@@ -5780,14 +5791,29 @@ class restore_move_module_questions_categories extends restore_execution_step {
                             $filtercondition,
                         );
                     }
-                    $questioncategoryid = $filtercondition['filter']['category']['values'][0];
-                    if (in_array($questioncategoryid, $categoryids)) {
+                    $questioncategoryid = $filtercondition['filter']['category']['values'][0] ?? null;
+
+                    if ($questioncategoryid !== null && $oldtopid && (int) $questioncategoryid === (int) $oldtopid) {
+                        // This reference points at the pre-merge "top level" category, which was consolidated
+                        // into $top above. Redirect it to $top's id/context rather than leaving it pointing at
+                        // the now-orphaned original category id.
+                        $filtercondition['filter']['category']['values'][0] = $top->id;
+                        $reference->questionscontextid = $newcontext->newitemid;
+                        $filtercondition['cat'] = "{$top->id},{$newcontext->newitemid}";
+                        $reference->filtercondition = json_encode($filtercondition);
+                        $DB->update_record('question_set_references', $reference);
+                    } else if (in_array($questioncategoryid, $categoryids)) {
                         // This is one of ours, update the questionscontextid and filtercondition fields.
                         $reference->questionscontextid = $newcontext->newitemid;
                         $filtercondition['cat'] = "{$questioncategoryid},{$newcontext->newitemid}";
                         $reference->filtercondition = json_encode($filtercondition);
                         $DB->update_record('question_set_references', $reference);
                     }
+                    // Anything not matched here (e.g. a reference pointing at a category that was
+                    // merged/relocated by some other restore path, such as a reused course-level
+                    // "Default for [course]" category) is caught by the unconditional final
+                    // correction pass in restore_fix_question_set_references_context, which runs
+                    // later in restore_final_task after all category relocation/merging is settled.
                 }
             }
 
@@ -5815,6 +5841,75 @@ class restore_move_module_questions_categories extends restore_execution_step {
         foreach ($categories as $category) {
             question_category_delete_safe($category);
         }
+    }
+}
+
+/**
+ * Execution step that performs a final, unconditional correction pass over every
+ * mod_quiz slot question_set_references row created by THIS restore, fixing any whose
+ * stored contextid (questionscontextid column, and the embedded filtercondition 'cat'
+ * value) still disagrees with the CURRENT, authoritative contextid of the question
+ * category it actually points at.
+ *
+ * process_quiz_question_legacy_instance() inserts these rows early in the restore with
+ * a best-effort/placeholder contextid, on the documented assumption that a later step
+ * will correct it once the referenced category reaches its final resting context.
+ * restore_move_module_questions_categories() performs that correction for categories
+ * relocated into a CONTEXT_MODULE (qbank) context, but there are other ways a category
+ * can end up somewhere other than where the placeholder assumed - e.g. a course-level
+ * "Default for [course]" category being merged into a pre-existing category elsewhere
+ * (as can happen on a same-site restore) is never revisited by that step at all, since
+ * it only scans CONTEXT_MODULE-level banks.
+ *
+ * Rather than track down and patch every individual place a category can be silently
+ * relocated/merged mid-restore, this step runs last (after
+ * restore_move_module_questions_categories and its course-level category cleanup) and
+ * simply makes sure every set reference agrees with reality at that point, regardless
+ * of which path caused it to drift.
+ *
+ * Must run after {@link restore_move_module_questions_categories}, since that step is
+ * what performs most of the actual relocation this step is verifying/correcting.
+ */
+class restore_fix_question_set_references_context extends restore_execution_step {
+    /**
+     * Correct any stale contextid on this restore's mod_quiz slot question_set_references.
+     *
+     * The actual comparison/fix logic lives in
+     * {@see \core_question\question_reference_manager::fix_stale_category_context()}, shared
+     * with question/cli/fix_stale_set_reference_category_context.php, which performs the same
+     * correction for records left over from before this fix existed. This step only works out
+     * which records belong to quizzes in the course just restored, so the check stays scoped to
+     * this restore rather than scanning the whole site on every restore.
+     */
+    protected function define_execution() {
+        global $DB;
+
+        $courseid = $this->task->get_courseid();
+
+        $cmids = $DB->get_fieldset_select(
+            'course_modules',
+            'id',
+            'course = ? AND module = (SELECT id FROM {modules} WHERE name = ?)',
+            [$courseid, 'quiz']
+        );
+        if (empty($cmids)) {
+            return;
+        }
+
+        [$insql, $inparams] = $DB->get_in_or_equal($cmids);
+        $contextids = $DB->get_fieldset_sql(
+            "SELECT ctx.id FROM {context} ctx WHERE ctx.contextlevel = ? AND ctx.instanceid {$insql}",
+            array_merge([CONTEXT_MODULE], $inparams)
+        );
+        if (empty($contextids)) {
+            return;
+        }
+
+        [$ctxinsql, $ctxinparams] = $DB->get_in_or_equal($contextids);
+        \core_question\question_reference_manager::fix_stale_category_context(
+            "component = ? AND questionarea = ? AND usingcontextid {$ctxinsql}",
+            array_merge(['mod_quiz', 'slot'], $ctxinparams)
+        );
     }
 }
 
