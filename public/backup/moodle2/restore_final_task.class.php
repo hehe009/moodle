@@ -44,6 +44,12 @@ class restore_final_task extends restore_task {
         // final (newly created) module context
         $this->add_step(new restore_move_module_questions_categories('move_module_question_categories'));
 
+        // Final, unconditional correction pass: make sure every mod_quiz slot
+        // question_set_references row created by this restore has a contextid that
+        // agrees with the current, authoritative contextid of the category it points
+        // at, regardless of which relocation/merge path the category went through.
+        $this->add_step(new restore_fix_question_set_references_context('fix_question_set_references_context'));
+
         // Create all the question files now that every question is in place
         // and every category has its final contextid associated
         $this->add_step(new restore_create_question_files('create_question_files'));
