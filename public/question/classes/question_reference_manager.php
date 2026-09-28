@@ -171,4 +171,129 @@ class question_reference_manager {
         $sets->close();
         return $updates;
     }
+
+    /**
+     * Ensure consistency of filter 'cat' parameter and questionscontextid against the CURRENT,
+     * authoritative contextid of the question category each set reference actually points at.
+     *
+     * @param string $select Optional SQL WHERE clause (without the "WHERE" keyword) to restrict
+     *     which question_set_references rows are checked, for example to scope this to a single
+     *     component/questionarea or a specific set of usingcontextid values. Empty string (the
+     *     default) checks every row in the table.
+     * @param array $params Query parameters for placeholders used in $select.
+     * @return int The number of records that were updated.
+     */
+    public static function fix_stale_category_context(string $select = '', array $params = []): int {
+        global $DB;
+        $updates = 0;
+        $sets = $DB->get_recordset_select('question_set_references', $select, $params);
+        foreach ($sets as $set) {
+            if (self::fix_stale_category_context_for_reference($set)) {
+                $updates++;
+            }
+        }
+        $sets->close();
+        return $updates;
+    }
+
+    /**
+     * Whether a context id, as read from stored data, identifies an existing module context.
+     *
+     * Only a module context can have a question bank top category. The id is not assumed to be
+     * valid: the context row may be gone, or it may be a different level entirely.
+     *
+     * @param int $contextid
+     * @return bool
+     */
+    public static function is_existing_module_context(int $contextid): bool {
+        $context = \core\context::instance_by_id($contextid, IGNORE_MISSING);
+        return $context && $context->contextlevel === CONTEXT_MODULE;
+    }
+
+    /**
+     * Resolve the top category for a context, safely.
+     *
+     * question_get_top_category() assumes its $contextid argument is a real, existing,
+     * CONTEXT_MODULE-level context - it throws if the context row is gone, and returns false
+     * (not an exception) for any non-module context, which a naive caller can easily turn into a
+     * fatal "Attempt to read property on bool" by accessing ->id on the result. Both states are
+     * reachable here: usingcontextid on a question_set_references row is not guaranteed to still
+     * point at a context that exists, or at a module-level one, particularly on a site with the
+     * kind of pre-existing data corruption this class exists to repair.
+     *
+     * @param int $contextid A context id, as read from stored data - not assumed to be valid.
+     * @param bool $create Passed through to question_get_top_category(). Pass false to guarantee
+     *     this is read-only (no question_categories row will be inserted as a side effect).
+     * @return \stdClass|null The top category, or null if $contextid does not identify an
+     *     existing, module-level context (see {@see is_existing_module_context()}), or - when
+     *     $create is false - if no top category exists for it yet.
+     */
+    public static function resolve_top_category_for_context(int $contextid, bool $create): ?\stdClass {
+        if (!self::is_existing_module_context($contextid)) {
+            return null;
+        }
+        $topcategory = question_get_top_category($contextid, $create);
+        return $topcategory ?: null;
+    }
+
+    /**
+     * Correct a single question_set_references row's questionscontextid and embedded
+     * filtercondition['cat'] value, if they disagree with the current, authoritative contextid
+     * of the question category the reference's filter condition actually points at.
+     *
+     * @param \stdClass $set A record from the question_set_references table.
+     * @return bool True if the record was stale and has been corrected, false if it was already
+     *     consistent, or could not be checked (for example because its filter condition could not
+     *     be parsed, the category it refers to no longer exists, or - for a placeholder category
+     *     id of 0 - its usingcontextid is not an existing module context).
+     */
+    protected static function fix_stale_category_context_for_reference(\stdClass $set): bool {
+        global $DB;
+
+        $filtercondition = json_decode($set->filtercondition, true);
+        if (!is_array($filtercondition)) {
+            return false;
+        }
+        if (!array_key_exists('filter', $filtercondition)) {
+            $filtercondition = self::convert_legacy_set_reference_filter_condition($filtercondition);
+        }
+
+        $catid = $filtercondition['filter']['category']['values'][0] ?? null;
+        if ($catid === null) {
+            return false;
+        }
+
+        $catidwasplaceholder = ((int) $catid === 0);
+        if ($catidwasplaceholder) {
+            if (empty($set->usingcontextid)) {
+                return false;
+            }
+            // This is the write path, so creating the context's top category if it does not
+            // exist yet is intended here.
+            $topcategory = self::resolve_top_category_for_context((int) $set->usingcontextid, true);
+            if (!$topcategory) {
+                // Usingcontextid does not identify an existing, module-level context, so there
+                // is nothing safe to substitute. Leave the record alone.
+                return false;
+            }
+            $catid = $topcategory->id;
+        }
+
+        $category = $DB->get_record('question_categories', ['id' => $catid]);
+        if (!$category) {
+            return false;
+        }
+
+        $authoritativecontextid = (int) $category->contextid;
+        if (!$catidwasplaceholder && (int) $set->questionscontextid === $authoritativecontextid) {
+            return false;
+        }
+
+        $filtercondition['filter']['category']['values'][0] = $catid;
+        $filtercondition['cat'] = "{$catid},{$authoritativecontextid}";
+        $set->questionscontextid = $authoritativecontextid;
+        $set->filtercondition = json_encode($filtercondition);
+        $DB->update_record('question_set_references', $set);
+        return true;
+    }
 }

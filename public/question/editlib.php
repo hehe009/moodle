@@ -323,8 +323,20 @@ function question_build_edit_resources($edittab, $baseurl, $params,
                 !$DB->count_records_select("question_categories", "id = ? AND contextid = ?", array($catparts[0], $catparts[1]))) {
             $exception = 'invalidcategory';
             if ($edittab === 'editq') {
-                // If this might be due to MDL-86691, return a message including fix instructions.
+                // Try to give a more targeted error message, pointing at whichever known cause
+                // this looks like, rather than a single generic message covering both.
                 $exception = 'invalidcategoryeditq';
+                if (!empty($catparts[0])) {
+                    $category = $DB->get_record('question_categories', ['id' => $catparts[0]]);
+                    if ($category && (string) $category->contextid !== (string) ($catparts[1] ?? '')) {
+                        // The category exists, but its current, authoritative contextid disagrees
+                        // with what was stored in the filter condition. This is the class of bug
+                        // fixed by question/cli/fix_stale_set_reference_category_context.php
+                        // fixer, since that one only checks a set reference against its own
+                        // previously-stored data, not against the category's actual current state.
+                        $exception = 'invalidcategoryeditqstalecontext';
+                    }
+                }
             }
             throw new \moodle_exception($exception, 'question');
         }

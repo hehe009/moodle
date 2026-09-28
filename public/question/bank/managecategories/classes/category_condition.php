@@ -331,6 +331,17 @@ class category_condition extends condition {
             || !has_capability('moodle/question:useall', $questionscontext)
         ) {
             $newcategoryid = $restorestep->get_mappingid('question_category', $oldcategoryid);
+            if (!$newcategoryid) {
+                // The category mapping has not been resolved yet at this point in the restore -
+                // this happens for a category with no parent (pre-3.5 "top level" categories, and
+                // the "top" category itself), whose final id is only assigned later, in
+                // restore_move_module_questions_categories(), which runs in the restore's final
+                // task, after this per-activity step has already run.
+                //
+                // Leave this reference pointing at the unresolved
+                // placeholder id.
+                $newcategoryid = 0;
+            }
             $filtercondition['filter']['category']['values'][0] = $newcategoryid;
         }
 
